@@ -1,0 +1,357 @@
+diff --git a/memcached.c b/memcached.c
+index 23b771a..078c466 100644
+--- a/memcached.c
++++ b/memcached.c
+@@ -1065,7 +1065,7 @@ static void complete_incr_bin(conn *c) {
+     if (c->binary_header.request.cas != 0) {
+         cas = c->binary_header.request.cas;
+     }
+-    switch(add_delta(c, key, nkey, c->cmd == PROTOCOL_BINARY_CMD_INCREMENT,
++    switch(arithmetic_op(c, key, nkey, c->cmd == PROTOCOL_BINARY_CMD_INCREMENT,
+                      req->message.body.delta, tmpbuf,
+                      &cas)) {
+     case OK:
+@@ -2565,9 +2565,11 @@ static void server_stats(ADD_STAT add_stats, conn *c) {
+     APPEND_STAT("delete_misses", "%llu", (unsigned long long)thread_stats.delete_misses);
+     APPEND_STAT("delete_hits", "%llu", (unsigned long long)slab_stats.delete_hits);
+     APPEND_STAT("incr_misses", "%llu", (unsigned long long)thread_stats.incr_misses);
++    APPEND_STAT("mult_misses", "%llu", (unsigned long long)thread_stats.mult_misses);
+     APPEND_STAT("incr_hits", "%llu", (unsigned long long)slab_stats.incr_hits);
+     APPEND_STAT("decr_misses", "%llu", (unsigned long long)thread_stats.decr_misses);
+     APPEND_STAT("decr_hits", "%llu", (unsigned long long)slab_stats.decr_hits);
++    APPEND_STAT("mult_hits", "%llu", (unsigned long long)slab_stats.mult_hits);
+     APPEND_STAT("cas_misses", "%llu", (unsigned long long)thread_stats.cas_misses);
+     APPEND_STAT("cas_hits", "%llu", (unsigned long long)slab_stats.cas_hits);
+     APPEND_STAT("cas_badval", "%llu", (unsigned long long)slab_stats.cas_badval);
+@@ -2989,12 +2991,11 @@ static void process_touch_command(conn *c, token_t *tokens, const size_t ntokens
+     }
+ }
+ 
+-static void process_arithmetic_command(conn *c, token_t *tokens, const size_t ntokens, const bool incr) {
++static void process_arithmetic_command(conn *c, token_t *tokens, const size_t ntokens, enum arithmetic arithmetic_type) {
+     char temp[INCR_MAX_STORAGE_LEN];
+     uint64_t delta;
+     char *key;
+     size_t nkey;
+-
+     assert(c != NULL);
+ 
+     set_noreply_maybe(c, tokens, ntokens);
+@@ -3012,7 +3013,7 @@ static void process_arithmetic_command(conn *c, token_t *tokens, const size_t nt
+         return;
+     }
+ 
+-    switch(add_delta(c, key, nkey, incr, delta, temp, NULL)) {
++    switch(arithmetic_op(c, key, nkey, arithmetic_type, delta, temp, NULL)) {
+     case OK:
+         out_string(c, temp);
+         break;
+@@ -3024,10 +3025,19 @@ static void process_arithmetic_command(conn *c, token_t *tokens, const size_t nt
+         break;
+     case DELTA_ITEM_NOT_FOUND:
+         pthread_mutex_lock(&c->thread->stats.mutex);
+-        if (incr) {
++        switch (arithmetic_type)
++        {
++        case INCR:
+             c->thread->stats.incr_misses++;
+-        } else {
++            break;
++        case DECR:
+             c->thread->stats.decr_misses++;
++            break;
++        case MULT:
++            c->thread->stats.mult_misses++;
++            break;
++        default:
++            break;
+         }
+         pthread_mutex_unlock(&c->thread->stats.mutex);
+ 
+@@ -3049,8 +3059,8 @@ static void process_arithmetic_command(conn *c, token_t *tokens, const size_t nt
+  *
+  * returns a response string to send back to the client.
+  */
+-enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
+-                                    const bool incr, const int64_t delta,
++enum delta_result_type do_arithmetic_op(conn *c, const char *key, const size_t nkey,
++                                    enum arithmetic arithmetic_type, const int64_t delta,
+                                     char *buf, uint64_t *cas,
+                                     const uint32_t hv) {
+     char *ptr;
+@@ -3075,24 +3085,60 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
+         return NON_NUMERIC;
+     }
+ 
+-    if (incr) {
++    switch (arithmetic_type)
++    {
++    case INCR:
+         value += delta;
+         MEMCACHED_COMMAND_INCR(c->sfd, ITEM_key(it), it->nkey, value);
+-    } else {
++        break;
++    case DECR:
+         if(delta > value) {
+             value = 0;
+         } else {
+             value -= delta;
+         }
+         MEMCACHED_COMMAND_DECR(c->sfd, ITEM_key(it), it->nkey, value);
++        break;
++    case MULT:
++        value *= delta;
++        MEMCACHED_COMMAND_MULT(c->sfd, ITEM_key(it), it->nkey, value);
++        break;
++    default:
++        break;
+     }
+ 
++    // if (incr) {
++    //     value += delta;
++    //     MEMCACHED_COMMAND_INCR(c->sfd, ITEM_key(it), it->nkey, value);
++    // } else {
++    //     if(delta > value) {
++    //         value = 0;
++    //     } else {
++    //         value -= delta;
++    //     }
++    //     MEMCACHED_COMMAND_DECR(c->sfd, ITEM_key(it), it->nkey, value);
++    // }
++
+     pthread_mutex_lock(&c->thread->stats.mutex);
+-    if (incr) {
++    switch (arithmetic_type)
++    {
++    case INCR:
+         c->thread->stats.slab_stats[it->slabs_clsid].incr_hits++;
+-    } else {
++        break;
++    case DECR:
+         c->thread->stats.slab_stats[it->slabs_clsid].decr_hits++;
++        break;
++    case MULT:
++        c->thread->stats.slab_stats[it->slabs_clsid].mult_hits++;
++        break;
++    default:
++        break;
+     }
++    // if (incr) {
++    //     c->thread->stats.slab_stats[it->slabs_clsid].incr_hits++;
++    // } else {
++    //     c->thread->stats.slab_stats[it->slabs_clsid].decr_hits++;
++    // }
+     pthread_mutex_unlock(&c->thread->stats.mutex);
+ 
+     snprintf(buf, INCR_MAX_STORAGE_LEN, "%llu", (unsigned long long)value);
+@@ -3263,7 +3309,11 @@ static void process_command(conn *c, char *command) {
+ 
+     } else if ((ntokens == 4 || ntokens == 5) && (strcmp(tokens[COMMAND_TOKEN].value, "incr") == 0)) {
+ 
+-        process_arithmetic_command(c, tokens, ntokens, 1);
++        process_arithmetic_command(c, tokens, ntokens, INCR);
++
++    } else if ((ntokens == 4 || ntokens == 5) && (strcmp(tokens[COMMAND_TOKEN].value, "mult") == 0)) {
++
++        process_arithmetic_command(c, tokens, ntokens, MULT);
+ 
+     } else if (ntokens >= 3 && (strcmp(tokens[COMMAND_TOKEN].value, "gets") == 0)) {
+ 
+@@ -3271,7 +3321,7 @@ static void process_command(conn *c, char *command) {
+ 
+     } else if ((ntokens == 4 || ntokens == 5) && (strcmp(tokens[COMMAND_TOKEN].value, "decr") == 0)) {
+ 
+-        process_arithmetic_command(c, tokens, ntokens, 0);
++        process_arithmetic_command(c, tokens, ntokens, DECR);
+ 
+     } else if (ntokens >= 3 && ntokens <= 5 && (strcmp(tokens[COMMAND_TOKEN].value, "delete") == 0)) {
+ 
+diff --git a/memcached.h b/memcached.h
+index 8a51352..f61248f 100644
+--- a/memcached.h
++++ b/memcached.h
+@@ -133,6 +133,14 @@ typedef void (*ADD_STAT)(const char *key, const uint16_t klen,
+                          const char *val, const uint32_t vlen,
+                          const void *cookie);
+ 
++// Possible arithmetic operations
++
++enum arithmetic {
++  INCR,
++  DECR,
++  MULT
++};
++
+ /*
+  * NOTE: If you modify this table you _MUST_ update the function state_text
+  */
+@@ -214,6 +222,7 @@ struct slab_stats {
+     uint64_t  cas_hits;
+     uint64_t  cas_badval;
+     uint64_t  incr_hits;
++    uint64_t  mult_hits;
+     uint64_t  decr_hits;
+ };
+ 
+@@ -228,6 +237,7 @@ struct thread_stats {
+     uint64_t          touch_misses;
+     uint64_t          delete_misses;
+     uint64_t          incr_misses;
++    uint64_t          mult_misses;
+     uint64_t          decr_misses;
+     uint64_t          cas_misses;
+     uint64_t          bytes_read;
+@@ -480,10 +490,10 @@ extern struct slab_rebalance slab_rebal;
+  * Functions
+  */
+ void do_accept_new_conns(const bool do_accept);
+-enum delta_result_type do_add_delta(conn *c, const char *key,
+-                                    const size_t nkey, const bool incr,
+-                                    const int64_t delta, char *buf,
+-                                    uint64_t *cas, const uint32_t hv);
++enum delta_result_type do_arithmetic_op(conn *c, const char *key, const size_t nkey,
++                                    enum arithmetic arithmetic_type, const int64_t delta,
++                                    char *buf, uint64_t *cas,
++                                    const uint32_t hv);
+ enum store_item_type do_store_item(item *item, int comm, conn* c, const uint32_t hv);
+ conn *conn_new(const int sfd, const enum conn_states init_state, const int event_flags, const int read_buffer_size, enum network_transport transport, struct event_base *base);
+ extern int daemonize(int nochdir, int noclose);
+@@ -515,11 +525,15 @@ void thread_init(int nthreads, struct event_base *main_base);
+ int  dispatch_event_add(int thread, conn *c);
+ void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags, int read_buffer_size, enum network_transport transport);
+ 
+-/* Lock wrappers for cache functions that are called from main loop. */
+-enum delta_result_type add_delta(conn *c, const char *key,
+-                                 const size_t nkey, const int incr,
++enum delta_result_type arithmetic_op(conn *c, const char *key,
++                                 const size_t nkey, enum arithmetic arithmetic_type,
+                                  const int64_t delta, char *buf,
+                                  uint64_t *cas);
++/* Lock wrappers for cache functions that are called from main loop. */
++// enum delta_result_type add_delta(conn *c, const char *key,
++//                                  const size_t nkey, const int incr,
++//                                  const int64_t delta, char *buf,
++//                                  uint64_t *cas);
+ void accept_new_conns(const bool do_accept);
+ conn *conn_from_freelist(void);
+ bool  conn_add_to_freelist(conn *c);
+diff --git a/slabs.c b/slabs.c
+index 753edd9..d3625ef 100644
+--- a/slabs.c
++++ b/slabs.c
+@@ -351,6 +351,8 @@ static void do_slabs_stats(ADD_STAT add_stats, void *c) {
+                     (unsigned long long)thread_stats.slab_stats[i].incr_hits);
+             APPEND_NUM_STAT(i, "decr_hits", "%llu",
+                     (unsigned long long)thread_stats.slab_stats[i].decr_hits);
++            APPEND_NUM_STAT(i, "mult_hits", "%llu",
++                    (unsigned long long)thread_stats.slab_stats[i].mult_hits);
+             APPEND_NUM_STAT(i, "cas_hits", "%llu",
+                     (unsigned long long)thread_stats.slab_stats[i].cas_hits);
+             APPEND_NUM_STAT(i, "cas_badval", "%llu",
+diff --git a/thread.c b/thread.c
+index 4e3e239..36eb7da 100644
+--- a/thread.c
++++ b/thread.c
+@@ -573,8 +573,8 @@ void item_update(item *item) {
+ /*
+  * Does arithmetic on a numeric item value.
+  */
+-enum delta_result_type add_delta(conn *c, const char *key,
+-                                 const size_t nkey, int incr,
++enum delta_result_type arithmetic_op(conn *c, const char *key,
++                                 const size_t nkey, enum arithmetic arithmetic_type,
+                                  const int64_t delta, char *buf,
+                                  uint64_t *cas) {
+     enum delta_result_type ret;
+@@ -582,11 +582,28 @@ enum delta_result_type add_delta(conn *c, const char *key,
+ 
+     hv = hash(key, nkey, 0);
+     item_lock(hv);
+-    ret = do_add_delta(c, key, nkey, incr, delta, buf, cas, hv);
++    ret = do_arithmetic_op(c, key, nkey, arithmetic_type, delta, buf, cas, hv);
+     item_unlock(hv);
+     return ret;
+ }
+ 
++/*
++ * Does arithmetic on a numeric item value.
++ */
++// enum delta_result_type add_delta(conn *c, const char *key,
++//                                  const size_t nkey, int incr,
++//                                  const int64_t delta, char *buf,
++//                                  uint64_t *cas) {
++//     enum delta_result_type ret;
++//     uint32_t hv;
++
++//     hv = hash(key, nkey, 0);
++//     item_lock(hv);
++//     ret = do_add_delta(c, key, nkey, incr, delta, buf, cas, hv);
++//     item_unlock(hv);
++//     return ret;
++// }
++
+ /*
+  * Stores an item in the cache (high level, obeys set/add/replace semantics)
+  */
+@@ -667,6 +684,7 @@ void threadlocal_stats_reset(void) {
+         threads[ii].stats.touch_misses = 0;
+         threads[ii].stats.delete_misses = 0;
+         threads[ii].stats.incr_misses = 0;
++        threads[ii].stats.mult_misses = 0;
+         threads[ii].stats.decr_misses = 0;
+         threads[ii].stats.cas_misses = 0;
+         threads[ii].stats.bytes_read = 0;
+@@ -683,6 +701,7 @@ void threadlocal_stats_reset(void) {
+             threads[ii].stats.slab_stats[sid].delete_hits = 0;
+             threads[ii].stats.slab_stats[sid].incr_hits = 0;
+             threads[ii].stats.slab_stats[sid].decr_hits = 0;
++            threads[ii].stats.slab_stats[sid].mult_hits = 0;
+             threads[ii].stats.slab_stats[sid].cas_hits = 0;
+             threads[ii].stats.slab_stats[sid].cas_badval = 0;
+         }
+@@ -708,6 +727,7 @@ void threadlocal_stats_aggregate(struct thread_stats *stats) {
+         stats->delete_misses += threads[ii].stats.delete_misses;
+         stats->decr_misses += threads[ii].stats.decr_misses;
+         stats->incr_misses += threads[ii].stats.incr_misses;
++        stats->mult_misses += threads[ii].stats.mult_misses;
+         stats->cas_misses += threads[ii].stats.cas_misses;
+         stats->bytes_read += threads[ii].stats.bytes_read;
+         stats->bytes_written += threads[ii].stats.bytes_written;
+@@ -727,6 +747,8 @@ void threadlocal_stats_aggregate(struct thread_stats *stats) {
+                 threads[ii].stats.slab_stats[sid].delete_hits;
+             stats->slab_stats[sid].decr_hits +=
+                 threads[ii].stats.slab_stats[sid].decr_hits;
++            stats->slab_stats[sid].mult_hits +=
++                threads[ii].stats.slab_stats[sid].mult_hits;
+             stats->slab_stats[sid].incr_hits +=
+                 threads[ii].stats.slab_stats[sid].incr_hits;
+             stats->slab_stats[sid].cas_hits +=
+@@ -748,6 +770,7 @@ void slab_stats_aggregate(struct thread_stats *stats, struct slab_stats *out) {
+     out->delete_hits = 0;
+     out->incr_hits = 0;
+     out->decr_hits = 0;
++    out->mult_hits = 0;
+     out->cas_hits = 0;
+     out->cas_badval = 0;
+ 
+@@ -757,6 +780,7 @@ void slab_stats_aggregate(struct thread_stats *stats, struct slab_stats *out) {
+         out->touch_hits += stats->slab_stats[sid].touch_hits;
+         out->delete_hits += stats->slab_stats[sid].delete_hits;
+         out->decr_hits += stats->slab_stats[sid].decr_hits;
++        out->mult_hits += stats->slab_stats[sid].mult_hits;
+         out->incr_hits += stats->slab_stats[sid].incr_hits;
+         out->cas_hits += stats->slab_stats[sid].cas_hits;
+         out->cas_badval += stats->slab_stats[sid].cas_badval;
+diff --git a/trace.h b/trace.h
+index dc792a0..8b6255b 100644
+--- a/trace.h
++++ b/trace.h
+@@ -26,6 +26,8 @@
+ #define MEMCACHED_COMMAND_TOUCH_ENABLED() (0)
+ #define MEMCACHED_COMMAND_INCR(arg0, arg1, arg2, arg3)
+ #define MEMCACHED_COMMAND_INCR_ENABLED() (0)
++#define MEMCACHED_COMMAND_MULT(arg0, arg1, arg2, arg3)
++#define MEMCACHED_COMMAND_MULT_ENABLED() (0)
+ #define MEMCACHED_COMMAND_PREPEND(arg0, arg1, arg2, arg3, arg4)
+ #define MEMCACHED_COMMAND_PREPEND_ENABLED() (0)
+ #define MEMCACHED_COMMAND_REPLACE(arg0, arg1, arg2, arg3, arg4)
